@@ -1,0 +1,70 @@
+name: Build and Deploy Kanboard
+
+on:
+  push:
+    branches: [ "main" ]
+    paths-ignore:
+      - 'terraform/**'
+      - 'README.md'
+  workflow_dispatch:
+permissions:
+  id-token: write   # Required for OIDC authentication to AWS
+  contents: read    # Required to checkout the code
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: pka-app
+  # Update this to your ACTUAL account ID found in your ECR URL
+  AWS_ACCOUNT_ID: "622778846520" 
+  GITOPS_REPO: ${{ github.repository_owner }}/pka-infra
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # This should match the role you created for GitHub Actions
+          role-to-assume: arn:aws:iam::622778846520:role/GitHubAction-EKS-Deployer
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, Tag, and Push Image
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          # Build the Docker image
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          # Also tag it as latest for convenience
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          # Push both tags
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Update GitOps Config Repo Pka-infra 
+        run: |
+          # 1. Clone the config repo using your Personal Access Token (PAT)
+          git clone https://${{ secrets.GITOPS_TOKEN }}@github.com/${{ env.GITOPS_REPO }}.git gitops-dir
+          cd gitops-dir/k8s
+          
+          # 2. Update the image tag in deployment.yaml
+          # We use sed to find the line starting with "image:" and replace the whole line
+          sed -i "s|image:.*|image: ${{ steps.build-image.outputs.image }}|g" deployment.yaml
+          
+          # 3. Commit and Push the change back to the config repo
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add deployment.yaml
+          git commit -m "chore: update image to ${{ github.sha }} [skip ci]"
+          git push origin main
